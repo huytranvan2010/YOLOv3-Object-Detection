@@ -1,0 +1,142 @@
+""" Cái này gần giống cho image thêm vòng while để lấy frame """ 
+# python yolo_video.py --input videos/traffic_monitor.mp4 --output output/traffic_monitor_out.avi --yolo yolo-coco
+# python yolo_video.py --output output/webcam.avi --yolo yolo-coco
+
+import numpy as np
+import argparse
+import cv2
+import os
+import time 
+
+ap = argparse.ArgumentParser()
+ap.add_argument("-i", "--input", help="path to input video")
+ap.add_argument("-o", "--output", required=True, help="path to output video")   # lưu video được label
+ap.add_argument("-y", "--yolo", required=True, help="base path to the YOLO directory")
+ap.add_argument("-c", "--confidence", type=float, default=0.5, help="minimum probability to filter weak detections")
+ap.add_argument("-t", "--threshold", type=float, default=0.3, help="threshold when applying non-maxima suppression")
+args = vars(ap.parse_args())
+
+""" Phần này xử lý các thông tin ban đầu, giống bên phần ảnh """
+# tải COCO class labels mà YOLO đã trained trên đó
+labelsPath = os.path.sep.join([args["yolo"], "coco.names"])     # đặt trong list
+# đọc hết file luôn bằng read() trả về string, dùng strip() để loại bỏ space, tab "\t", xuống dòng "\n" ở đầu
+# và cuối chuỗi (ở giữa không ảnh hưởng, có thể  thêm kí tự vào strip()), sau đó chuyển thành list 
+LABELS = open(labelsPath).read().strip().split("\n")    
+
+# khởi tạo list các màu để biểu diễn labels
+np.random.seed(42)
+COLORS = np.random.randint(0, 255, size=(len(LABELS), 3))   # mỗi hàng là 1 màu (3 giá trị)
+
+# lấy đường dẫn đến YOLO weights và model configuration
+weightsPath = os.path.sep.join([args["yolo"], "yolov3.weights"])
+configPath = os.path.sep.join([args["yolo"], "yolov3.cfg"])
+
+# load YOLO detector đã pre-trained trên COCO dataset (80 classes) bằng OpenCV
+print(["[INFO] loading YOLO from the disk..."])
+net = cv2.dnn.readNetFromDarknet(configPath, weightsPath)
+
+""" Lấy video """
+# lấy đường dẫn video tùy thuộc có truyền vào hay không 
+if not args.get("input", False):
+    video = cv2.VideoCapture(0)
+else: 
+    video = cv2.VideoCapture(args["input"])
+
+writer = None   # để lưu video
+
+while True:
+    # Đọc frame, phần này khác ảnh một chút
+    grabbed, image = video.read()
+    (H, W) = image.shape[:2]    # lấy height và width
+
+    if not grabbed:
+        break
+
+    """ Lấy layer names của các output layers (chỉ các output layers thôi) """
+    # Cách 1
+    layer_names = net.getLayerNames()   # tên của tất cả các layers trong YOLO
+    output_layer_names = [layer_names[i[0] - 1] for i in net.getUnconnectedOutLayers()]    # getUnconnectedOutLayers() - it gives you the final layers number in the list from, lấy index trừ 1
+
+    # # Cách 2
+    # output_layer_names = net.getUnconnectedOutLayersNames()
+
+    """ Tiền xử lý ảnh, đưa vào model và đưa ra output """
+    # construct a blob from the input image and then perform a forward pass of the YOLO
+    # object detector, giving us our bounding boxes and associated probabilities
+    # tiền xử lý ảnh: rescale, resize, swapRB vì lúc ở trên đọc bằng OpenCV, không crop
+    blob = cv2.dnn.blobFromImage(image, 1/255., (416, 416), swapRB=True, crop=False)    # tiền xử lý ảnh để tí cho vào YOLO
+    # Truyền input vào mạng
+    net.setInput(blob)
+    start = time.time()
+    # Lấy đầu ra ở các output layers bằng cách truyền tên của output layers vào method forward
+    layerOutputs = net.forward(output_layer_names)
+    end = time.time()
+
+    # show timing information on YOLO
+    print("[INFO] YOLO look {:.6f} seconds".format(end - start))
+
+    """ Khởi tạo list các detected bounding boxes, confidences và class IDs """
+    boxes = []
+    confidences = []
+    classIDs = []   # detected object's class label
+
+    # Duyệt qua các layer outputs, có mấy outputs để có thể phát hiện được các kích thước khác nhau
+    for output in layerOutputs:
+        # duyệt qua each of the detections, trong mỗi output lại phát hiện được nhiều object
+        for detection in output:
+            # trích xuất the class ID và confidence của the current object detection
+            # bỏ qua 5 cái đầu là x, y, w, h và objectness score, những cái sau là class scores, detection có 85 elements
+            scores = detection[5:]      
+            classID = np.argmax(scores)
+            confidence = scores[classID]
+
+            # chỉ quan tâm predictions nào có confidence đủ lớn (> threshold)
+            if confidence > args["confidence"]:
+                # scale the bounding box back to the size of the image
+                # YOLO trả về  relative size
+                box = detection[0:4] * np.array([W, H, W, H])   # element-wise (center_x, center_y, w, h)
+                centerX, centerY, width, height = box.astype("int")     # int về cần vẽ pixel
+
+                # Use the center coordinates, width and height to get the coordinates of the top left corner
+                # tính toạ độ góc trên bên trái
+                x = int(centerX - (width / 2))
+                y = int(centerY - (height / 2))
+
+                # update our list of bouding boxes (x, y, w, h), cập nhật list
+                boxes.append([x, y, int(width), int(height)])
+                confidences.append(float(confidence))
+                classIDs.append(classID)
+
+    """ Áp  dụng non-max suppression để loại bỏ bớt các overlapping bounding boxes mà cùng vật thể """
+    idxs = cv2.dnn.NMSBoxes(boxes, confidences, args["confidence"], args["threshold"])
+
+    # Vẽ các box vad class text lên ảnh
+    # cần đảm bảo có ít nhất 1 detection
+    if len(idxs) > 0:
+        # duyệt qua các indexes 
+        for i in idxs.flatten():    # flatten() ra nó mới về dạng list
+            # lấy ra các thông tin của bounding boxes
+            x, y, w, h = boxes[i]   # vì ở trên lưu boxes là list of list x, y, w, h
+
+            # draw the bounding box and label on the image
+            color = [int(c) for c in COLORS[classIDs[i]]]   # lấy 1 hàng nhưng duyệt qua để tạo list
+            cv2.rectangle(image, (x, y), (x + w, y + h), color, 2)
+            text = "{}: {:.4f}".format(LABELS[classIDs[i]], confidences[i])
+            cv2.putText(image, text, (x, y - 5), cv2.FONT_HERSHEY_SIMPLEX, 0.5, color, 2)
+
+    """ Save video """
+    # Kiểm tra xem video writer là None
+    if writer is None:
+        fourcc = cv2.VideoWriter_fourcc(*"MJPG")
+        writer = cv2.VideoWriter(args["output"], fourcc, 30, (image.shape[1], image.shape[0]), True)
+
+    # ghi output frame to disk
+    writer.write(image)
+
+    if cv2.waitKey(1) & 0xFF == ord("q"):
+        break
+
+print("[INFO] leaning up...")
+writer.release()
+video.release()
+cv2.destroyAllWindows()
